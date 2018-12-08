@@ -1,124 +1,161 @@
-from socket import *
 import argparse
+import socket
+import threading
+import queue
+import sys
+import signal
+
+###########################################################################
+#   SocketThread
+#   All commincation between client and server will go through this class.
+#   This is a worker thread class that will receive message on a UDP socket
+#   and pass the message to the main thread in a thread-safe way.
+#   It will handle the case of timeout/out-of-order/duplicate packets.
+###########################################################################
+class SocketThread(threading.Thread):
+    class Error(Exception):
+        pass
+    class MaxIterationExceeded(Error):
+        pass
+
+    def __init__(self,serverName,serverPort):
+        super().__init__()
+        self.serverAddress=(serverName, serverPort)
+        self.stopper=threading.Event()
+        self.messages_received=queue.Queue()
+        self.clientSocket=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.clientSocket.settimeout(1)
+        self.uniqueId=0
+
+    # When the thread start it will keep waiting for packets on the socket
+    # When it recieves a packet it will put it in a queue so that the main thread can pick it up later
+    # Unless the message is "ping", in this case it will reply with "pong" without queueing it
+    # It will also throw away message with format not specified by the protocol
+    def run(self):
+        while not self.stopper.is_set():
+            try:
+                serverResponse,serverAddress = self.clientSocket.recvfrom(2048)
+            except socket.timeout:
+                continue
+            serverResponse = serverResponse.decode()
+            if serverResponse == 'ping':
+                self.send('pong')
+            else:
+                try:
+                    id, move, status = [int(s) for s in serverResponse.split(" ")]
+                except:
+                    # unknown format, ignore this packet
+                    continue
+                self.messages_received.put(serverResponse)
+        self.clientSocket.close()
+    
+    # This function will send message to server
+    def send(self, message):
+        self.clientSocket.sendto(message.encode(),self.serverAddress)
+    
+    # This function will wait for message from server 
+    def receive(self, timeout=None):
+        try:
+            message = self.messages_received.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError
+        return message
+
+    # This function will send a message to server, expecting a reply
+    # Only reply that correspond to the message will be returned
+    def request(self, message):
+        # Prepend a unique id to the message before sending it
+        # The server will reply with the same id before its reply
+        id = self.uniqueId
+        self.uniqueId += 1
+        message = str(id)+" "+message
+        # send and resend message every 0.5 seconds
+        # until server reply or it 10 messages has been sent without a reply
+        max_num_tries = 10
+        num_tries = 0
+        self.send(message)
+        while num_tries < max_num_tries:
+            try:
+                response = self.receive(0.5)
+            except TimeoutError:
+                self.send(message)
+                num_tries += 1
+                continue
+            else:
+                responseId = response.split(" ")[0]
+                if responseId != str(id):
+                    # wrong packet, get another one
+                    continue
+                # we have the expected reply
+                # remove the unique id before passing it back
+                return response[len(responseId)+1:]
+        # no more tries
+        print("The server is not available at this time.")
+        raise SocketThread.MaxIterationExceeded
+    def sendClose(self):
+        id = self.uniqueId
+        self.uniqueId += 1
+        message = str(id)+" close"
+        self.send(message)
+    def stop(self):
+        self.stopper.set()
+
 
 ##########################################################################################
 #   playTicTacToe
-#   Calling this function will:
+#   Calling this function will take the following steps:
 #   1.  send a (UDP) request to the server to begin a new game.
-#       It will handle the case of lost or dulplicate packets.
-#   2.  It will validate user move and sent it to server,
+#   2.  It will prompt and validate user move and sent it to server,
 #       and the server will reply with its move and game status.
-#       Game state will be rendered at each move and relavent messages will be printed.
-#   3.  (2) will repeat until the game ends.
-#   The state will be stored as local variables within the function.
-#   Please refer to the document for the protocol between client and server.
+#       Game state will be rendered after each move and relavent messages will be printed.
+#   3.  (2) will repeat until the server decides game ends.
+#   The game state will be stored as local variables
+#   Please refer to the document for the communication protocol between client and server.
 #######################################################################################
-def playTicTacToe(serverName,clientFirst, serverPort=12000):
-
-    clientSocket=socket(AF_INET, SOCK_DGRAM)
-    clientSocket.settimeout(1)
-    moveNum=0
+def playTicTacToe(sockListener,clientFirst):
     cMoves=set()
     sMoves=set()
-    lastMoveByClient = None
-    gameOver = False
-        
-    # request
-    # This function acts as the interface between client and server.
-    # message will be sent to server and it will wait for server's response
-    def request(message):
-        
-        while True:
-            try:
-                clientSocket.sendto(message.encode(),(serverName,serverPort))
-                serverResponse,serverAddress = clientSocket.recvfrom(2048)
-            except timeout:
-                continue
-            return serverResponse.decode()
-        
-        #The following is mocking server response for testing purpose
-        # Comment out code above and uncomment code below to run without a server.
-        # mock request start
-        '''
-        if message == "X":
-            return "0 0 0"
-        if message == "O":
-            return "1 1 0"
-        winning_sets=[
-            {1,2,3},
-            {4,5,6},
-            {7,8,9},
-            {1,4,7},
-            {2,5,8},
-            {3,6,9},
-            {3,5,7},
-            {1,5,9}
-        ]
-        cWins=any(elem.issubset(cMoves) for elem in winning_sets)
-        availableMoves ={1,2,3,4,5,6,7,8,9}-cMoves-sMoves
-        move = 0 if len(availableMoves)==0 else availableMoves.pop()
-        sWins=any(elem.issubset(sMoves|{move}) for elem in winning_sets)
-        status = 1 if cWins else 2 if sWins else 3 if len(availableMoves)==0 else 0
-        moveNumber = moveNum if move == 0 else moveNum+1
-        return str(moveNumber)+" "+str(move)+" "+str(status)
-        '''
-        # mock reques end
 
     #   waitForServerMove
     #   This function will send the last move by client and wait for server's respond.
-    #   The message to server will contain move number and client's move, delimited by " "
-    #   The server response will contain move number, server's move, and a status number, deliminated by " ".
-    #   status codes are [ 0:continue the game, 1:client wins, 2:server wins, 3:draw]
-    #   In case of timeout, it will resend the message.
-    #   Move number is used to identity duplicate & out-of-order reply
-    def waitForServerMove():
-        nonlocal moveNum
-        nonlocal lastMoveByClient
-        # send last client move until server respond with a new state
-        message = str(moveNum)+' '+str(lastMoveByClient)
+    #   The server response will contain server's move and a status number, deliminated by " ".
+    #   status codes are [ 0:in progess, 1:client wins, 2:server wins, 3:tie]
+    def waitForServerMove(clientMove):
+        try:
+            reply = sockListener.request(clientMove)
+        except SocketThread.MaxIterationExceeded:
+            raise
+        serverMove, status = [int(s) for s in reply.split(" ")]
+        IN_PROGRESS, CLIENT_WIN, SERVER_WIN, TIE = 0,1,2,3
 
-        while True:
-            reply = request(message)
-            moveNumber, serverMove, status = [int(s) for s in reply.split(" ")]
-            if moveNumber == moveNum or moveNumber == moveNum+1:
-                # correct move number
-                break
-            # have to request again if the packet has the wrong move number
-
-
-        if status == 0:
-            # continue the game
+        if status == IN_PROGRESS:
             sMoves.add(serverMove)
-            moveNum = moveNumber
             render()
-            return False
-        elif status == 1:
-            # game ends on client last move, client wins
+            return True
+
+        elif status == CLIENT_WIN:
             print("You win.")
-        elif status == 2:
-            # game ends on server last move, server wins
+
+        elif status == SERVER_WIN:
             sMoves.add(serverMove)
-            moveNum = moveNumber
             render()
             print("Server wins.")
-        elif status == 3:
-            #draws
-            if moveNumber == moveNum+1:
+
+        elif status == TIE:
+            if serverMove != 0:
                 # game ends on server last move
                 sMoves.add(serverMove)
-                moveNum = moveNumber
                 render()
-            print("Game ends in a draw.")
-        nonlocal gameOver
-        gameOver=True
+            print("Game ends in a tie.")
+
+        return False
 
     
     #   waitForUserMove
     #   This function prompt user for a valid move,
     #   then render the game state after the move.
     def waitForUserMove():
-        nonlocal moveNum
-        nonlocal lastMoveByClient
+
         def validateInput(move):
             try:
                 move = int(move)
@@ -135,10 +172,10 @@ def playTicTacToe(serverName,clientFirst, serverPort=12000):
             move = input("Please enter your move: ")
             if validateInput(move):
                 break
-        lastMoveByClient = int(move)
+
         cMoves.add(int(move))
-        moveNum+=1
         render()
+        return move
 
 
     #   render
@@ -179,29 +216,54 @@ def playTicTacToe(serverName,clientFirst, serverPort=12000):
     def initializeGameWithServer():
         #   X: ask server to initialize the game with client first move
         #   O: ask server to initialize the game with server first move
-        #   server will reply with "moveNumber move status":
-        #       "0 0 0"     if client has the first move
-        #       "1 move 0"  if server has the first move, move:[0-9]
-        reply = request("X" if clientFirst else "O")
-        moveNumber, serverMove, status = [int(s) for s in reply.split(" ")]
-        if moveNumber!=0:
-            sMoves.add(serverMove)
-            moveNum = moveNumber
-    #  The function that contain the main execution flow of the game.
+        #   server will reply with:
+        #       "0 0"     if client has the first move
+        #       "move 0"  if server has the first move, move:[0-9]
+        print("Inviting the server ...")
+        try:
+            reply = sockListener.request("X" if clientFirst else "O")
+            print(reply)
+        except SocketThread.MaxIterationExceeded:
+            raise
+        else:
+            serverMove, status = [int(s) for s in reply.split(" ")]
+            if serverMove != 0:
+                sMoves.add(serverMove)
+ 
+    #  The function that controls the main execution flow of the game.
     def start():
-        initializeGameWithServer()
+        def endGame():
+            sockListener.stop()
+            sockListener.join()
+            print("Exiting the game ...")
+        sockListener.start()
+        try:
+            initializeGameWithServer()
+        except SocketThread.MaxIterationExceeded:
+            return endGame()
+
         welcomeMessage()
         render()
         clientTurn = True
-        while not gameOver:
+        playerMove=None
+        inProgress = True
+        while inProgress:
             if clientTurn:
                 print("Your Turn.")
-                waitForUserMove()
+                playerMove = waitForUserMove()
             else:
                 print("Waiting for server ...")
-                waitForServerMove()
+                try:
+                    inProgress = waitForServerMove(playerMove)
+                except sockListener.MaxIterationExceeded:
+                    return endGame()
+
             clientTurn = not clientTurn
-        clientSocket.close()
+        
+        sockListener.sendClose()
+        print("Thank you for playing the game.")
+        return endGame()
+    
     # Start the game
     start()
 
@@ -213,8 +275,16 @@ if __name__ == "__main__":
     parser.add_argument("-c", "--clientStart", action="store_true", help="use this if client goes first")
     # read arguments from the command line
     args = parser.parse_args()
-
     serverIP=args.server
     clientStart=args.clientStart
-    playTicTacToe(serverName=serverIP,clientFirst=clientStart)
+
+    def signal_handler(sig, frame):
+        print("interruption!")
+
+        sys.exit(0)
+    signal.signal(signal.SIGINT,signal_handler)
+
+    sock_thread = SocketThread (serverIP, serverPort=12000)
+    playTicTacToe(sockListener=sock_thread,clientFirst=clientStart)
+    
     
