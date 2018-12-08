@@ -25,6 +25,7 @@ class socketReceiver(threading.Thread):
             except:
                 raise
                 break
+            
             message = message.decode()
 
             # only create a worker thread if the client request a new game
@@ -89,11 +90,23 @@ class ClientReplier(threading.Thread):
         sMoves = {move}
         self.send(last_reply)
 
+        MAX_NUMBER_OF_PING = 5
+        numPings=0
+
         while not self.stopper.is_set():
             try:
                 message = self.queue.get(timeout=1)
             except queue.Empty:
+                # timed out
+                if numPings <= MAX_NUMBER_OF_PING:
+                    self.send("ping")
+                    numPings += 1
+                else:
+                    self.stop()
                 continue
+            if message == "pong":
+                numPings = 0
+
             try:
                 message_id = int(message.split(" ")[0])
             except ValueError:
@@ -172,14 +185,16 @@ if __name__ == "__main__":
 
     
     while True:
-        print([t.getName() for k,t in threads.items()])
-        del_list = []
+        # each second remove dead threads
+        dead_thread_keys = []
         with lock:
             for k in threads:
                 if not threads[k].is_alive():
-                    del_list.append(k)
-            for k in del_list:
-                del threads[k]
+                    dead_thread_keys.append(k)
+            for k in dead_thread_keys:
+                t = threads.pop(k)
+                t.join()
+        print([t.getName() for k,t in threads.items()])
         time.sleep(1)
    
 
