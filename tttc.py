@@ -15,7 +15,7 @@ import signal
 class SocketThread(threading.Thread):
     class Error(Exception):
         pass
-    class MaxIterationExceeded(Error):
+    class SocketError(Error):
         pass
 
     def __init__(self,serverName,serverPort):
@@ -37,6 +37,9 @@ class SocketThread(threading.Thread):
                 serverResponse,serverAddress = self.clientSocket.recvfrom(2048)
             except socket.timeout:
                 continue
+            except Exception as e:
+                self.stop()
+                break
             serverResponse = serverResponse.decode()
             if serverResponse == 'ping':
                 self.send('pong')
@@ -47,19 +50,26 @@ class SocketThread(threading.Thread):
                     # unknown format, ignore this packet
                     continue
                 self.messages_received.put(serverResponse)
-        self.clientSocket.close()
+        self._close()
     
     # This function will send message to server
     def send(self, message):
-        self.clientSocket.sendto(message.encode(),self.serverAddress)
+        try:
+            self.clientSocket.sendto(message.encode(),self.serverAddress)
+        except:
+            self.stop()
+
     
     # This function will wait for message from server 
     def receive(self, timeout=None):
-        try:
-            message = self.messages_received.get(timeout=timeout)
-        except queue.Empty:
-            raise TimeoutError
-        return message
+        if self.stopper.is_set():
+           raise SocketThread.SocketError
+        else:
+            try:
+                message = self.messages_received.get(timeout=timeout)
+            except queue.Empty:
+                raise TimeoutError
+            return message
 
     # This function will send a message to server, expecting a reply
     # Only reply that correspond to the message will be returned
@@ -74,13 +84,15 @@ class SocketThread(threading.Thread):
         max_num_tries = 10
         num_tries = 0
         self.send(message)
-        while num_tries < max_num_tries:
+        while num_tries < max_num_tries and not self.stopper.is_set():
             try:
                 response = self.receive(0.5)
             except TimeoutError:
                 self.send(message)
                 num_tries += 1
                 continue
+            except SocketThread.SocketError:
+                break
             else:
                 responseId = response.split(" ")[0]
                 if responseId != str(id):
@@ -91,14 +103,22 @@ class SocketThread(threading.Thread):
                 return response[len(responseId)+1:]
         # no more tries
         print("The server is not available at this time.")
-        raise SocketThread.MaxIterationExceeded
-    def sendClose(self):
+        raise SocketThread.SocketError
+
+    # tell the server we are about to close the socket
+    # then close the socket without waiting for a response
+    def _close(self):
         id = self.uniqueId
         self.uniqueId += 1
         message = str(id)+" close"
         self.send(message)
+        self.clientSocket.close()
+
+    # call this function to stop the thread
+    # do not call _close() directly
     def stop(self):
         self.stopper.set()
+        
 
 
 ##########################################################################################
@@ -123,30 +143,31 @@ def playTicTacToe(sockListener,clientFirst):
     def waitForServerMove(clientMove):
         try:
             reply = sockListener.request(clientMove)
-        except SocketThread.MaxIterationExceeded:
+        except SocketThread.SocketError:
             raise
-        serverMove, status = [int(s) for s in reply.split(" ")]
-        IN_PROGRESS, CLIENT_WIN, SERVER_WIN, TIE = 0,1,2,3
+        else:
+            serverMove, status = [int(s) for s in reply.split(" ")]
+            IN_PROGRESS, CLIENT_WIN, SERVER_WIN, TIE = 0,1,2,3
 
-        if status == IN_PROGRESS:
-            sMoves.add(serverMove)
-            render()
-            return True
-
-        elif status == CLIENT_WIN:
-            print("You win.")
-
-        elif status == SERVER_WIN:
-            sMoves.add(serverMove)
-            render()
-            print("Server wins.")
-
-        elif status == TIE:
-            if serverMove != 0:
-                # game ends on server last move
+            if status == IN_PROGRESS:
                 sMoves.add(serverMove)
                 render()
-            print("Game ends in a tie.")
+                return True
+
+            elif status == CLIENT_WIN:
+                print("You win.")
+
+            elif status == SERVER_WIN:
+                sMoves.add(serverMove)
+                render()
+                print("You lose.")
+
+            elif status == TIE:
+                if serverMove != 0:
+                    # game ends on server last move
+                    sMoves.add(serverMove)
+                    render()
+                print("Game ends in a tie.")
 
         return False
 
@@ -169,7 +190,11 @@ def playTicTacToe(sockListener,clientFirst):
             return False
 
         while True:
-            move = input("Please enter your move: ")
+            try:
+                move = input("Please enter your move: ")
+            except:
+                raise
+                return
             if validateInput(move):
                 break
 
@@ -222,8 +247,7 @@ def playTicTacToe(sockListener,clientFirst):
         print("Inviting the server ...")
         try:
             reply = sockListener.request("X" if clientFirst else "O")
-            print(reply)
-        except SocketThread.MaxIterationExceeded:
+        except SocketThread.SocketError:
             raise
         else:
             serverMove, status = [int(s) for s in reply.split(" ")]
@@ -236,10 +260,10 @@ def playTicTacToe(sockListener,clientFirst):
             sockListener.stop()
             sockListener.join()
             print("Exiting the game ...")
-        sockListener.start()
+
         try:
             initializeGameWithServer()
-        except SocketThread.MaxIterationExceeded:
+        except SocketThread.SocketError:
             return endGame()
 
         welcomeMessage()
@@ -250,17 +274,20 @@ def playTicTacToe(sockListener,clientFirst):
         while inProgress:
             if clientTurn:
                 print("Your Turn.")
-                playerMove = waitForUserMove()
+                try:
+                    playerMove = waitForUserMove()
+                except:
+                    print("interrupted")
+                    return endGame()
             else:
                 print("Waiting for server ...")
                 try:
                     inProgress = waitForServerMove(playerMove)
-                except sockListener.MaxIterationExceeded:
+                except SocketThread.SocketError:
                     return endGame()
 
             clientTurn = not clientTurn
         
-        sockListener.sendClose()
         print("Thank you for playing the game.")
         return endGame()
     
@@ -278,13 +305,17 @@ if __name__ == "__main__":
     serverIP=args.server
     clientStart=args.clientStart
 
+    sock_thread = SocketThread (serverIP, serverPort=12000)
+    sock_thread.start()
+
+    
     def signal_handler(sig, frame):
         print("interruption!")
-
-        sys.exit(0)
+        sock_thread.stop()
+        sock_thread.join()
+        #sys.exit(0)
     signal.signal(signal.SIGINT,signal_handler)
 
-    sock_thread = SocketThread (serverIP, serverPort=12000)
     playTicTacToe(sockListener=sock_thread,clientFirst=clientStart)
     
     
