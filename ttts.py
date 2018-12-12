@@ -1,3 +1,14 @@
+#----------------------------------------------
+#   ttts.py
+#   This file contain the tic tac toe server program.
+#   Usage: python ttts.py
+#
+#   CMSC 481 Project- UDP Tic Tac Toe          
+#   2018 Fall                                  
+#   Author: Chen Kuo                           
+#   ckuo1@umbc.edu                             
+#----------------------------------------------
+
 import socket
 import threading
 import sys
@@ -5,7 +16,7 @@ import signal
 import time
 import queue
 import random
-
+SERVER_PORT = 12000
 ##################################################################
 # socketReceiver 
 # This is a thread class that will receive datagram on the socket
@@ -187,7 +198,7 @@ class ClientReplier(threading.Thread):
 
 
 if __name__ == "__main__":
-    serverPort = 12000
+    serverPort = SERVER_PORT
     serverSocket=socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     serverSocket.bind(('',serverPort))
     serverSocket.settimeout(1)

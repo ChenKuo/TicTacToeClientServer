@@ -1,10 +1,22 @@
+#----------------------------------------------
+#   tttc.py
+#   This file contain the tic tac toe client program.
+#   Usage: python tttc.py [-c] [-s serverIP]
+#
+#   CMSC 481 Project- UDP Tic Tac Toe          
+#   2018 Fall                                  
+#   Author: Chen Kuo                           
+#   ckuo1@umbc.edu                             
+#----------------------------------------------
+
+
 import argparse
 import socket
 import threading
 import queue
 import sys
 import signal
-
+SERVER_PORT = 12000
 ###########################################################################
 #   SocketThread
 #   All commincation between client and server will go through this class.
@@ -305,7 +317,7 @@ if __name__ == "__main__":
     serverIP=args.server
     clientStart=args.clientStart
 
-    sock_thread = SocketThread (serverIP, serverPort=12000)
+    sock_thread = SocketThread (serverIP, serverPort=SERVER_PORT)
     sock_thread.start()
 
     
